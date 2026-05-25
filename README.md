@@ -22,6 +22,20 @@ environment variables, those ignores no longer apply.
 veilfs closes that gap by removing the relevant files from the agent's
 filesystem entirely. They are not denied. They don't exist.
 
+## Scope
+
+veilfs is a file-visibility tool, not a sandbox. It hides a chosen set
+of files; it does not try to contain a process that actively works to
+reach them by other means — re-mounting, walking `/proc`, or reading a
+backing path directly. Doing that well would mean reinventing a
+container runtime, and there are good ones already.
+
+If you need a strict boundary — for an untrusted or adversarial agent —
+run veilfs **inside** a real sandbox and let each tool do one job: the
+sandbox (Docker, bubblewrap, a VM) contains the process, and veilfs
+hides the files within it. The Docker quick-start below is exactly that
+combination.
+
 ## Why FUSE
 
 The hiding happens at the filesystem layer, so it applies to every
