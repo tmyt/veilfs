@@ -4,9 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"veilfs/internal/cli"
 )
+
+// version is the release version, injected at build time via
+// -ldflags "-X main.version=...". It stays "dev" for plain `go build`.
+var version = "dev"
 
 const usage = `veilfs hides files matching a .veilignore pattern from a passthrough FUSE mount.
 
@@ -14,6 +19,7 @@ Usage:
   veilfs mount [-f] [--config FILE] <source> <target>
   veilfs umount <target>
   veilfs run [flags] [<source>] [-- <command> [args...]]
+  veilfs version          (also -v / --version)
 
 Commands:
   mount   Mount <source> at <target>, applying the .veilignore at the source
@@ -49,6 +55,9 @@ func main() {
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stdout, usage)
 		return
+	case "-v", "--version", "version":
+		fmt.Fprintln(os.Stdout, versionString())
+		return
 	default:
 		fmt.Fprintf(os.Stderr, "veilfs: unknown subcommand %q\n\n%s", os.Args[1], usage)
 		os.Exit(2)
@@ -64,4 +73,34 @@ func main() {
 		fmt.Fprintf(os.Stderr, "veilfs: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// versionString renders the build version: the injected `version` (a
+// release tag in CI, "dev" otherwise), with the VCS revision appended
+// when the binary was built with version-control stamping (the default
+// for a local `go build`).
+func versionString() string {
+	v := version
+	if info, ok := debug.ReadBuildInfo(); ok {
+		var rev string
+		var dirty bool
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				rev = s.Value
+			case "vcs.modified":
+				dirty = s.Value == "true"
+			}
+		}
+		if rev != "" {
+			if len(rev) > 12 {
+				rev = rev[:12]
+			}
+			if dirty {
+				rev += "-dirty"
+			}
+			return fmt.Sprintf("veilfs %s (%s)", v, rev)
+		}
+	}
+	return "veilfs " + v
 }
