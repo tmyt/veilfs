@@ -1,3 +1,4 @@
 /veilfs
 /dist/
 .*.swp
+.claude/settings.local.json

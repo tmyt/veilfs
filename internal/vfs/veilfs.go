@@ -835,13 +835,35 @@ func (g *guardedFile) Ioctl(ctx context.Context, cmd uint32, arg uint64, input [
 }
 
 // MountOptions controls how Mount behaves. Zero values are sensible
-// defaults for veilfs (allow_other off, single-threaded entry timeouts).
+// defaults for veilfs (allow_other off, kernel caches disabled).
 type MountOptions struct {
 	// Debug enables verbose FUSE protocol logging on stderr.
 	Debug bool
 	// FsName is reported to userspace via /proc/mounts and `mount`. If
 	// empty, "veilfs" is used.
 	FsName string
+	// CacheTimeout sets BOTH the FUSE EntryTimeout (positive-dentry
+	// cache) AND the AttrTimeout (stat cache) on the mount. The
+	// default of 0 disables both kernel caches, which forces every
+	// path resolution and stat to re-enter veilfs and consult the
+	// matcher — that is the secure default.
+	//
+	// Setting this to a non-zero value trades secrecy for throughput:
+	// for the configured window after a .veilignore reload, an
+	// already-resolved hidden path can still answer stat / lookup
+	// from the kernel's cache. Operators with heavy traversal
+	// workloads (`find`, `git status`, build systems) may want a
+	// small value (e.g. 200ms–1s) to amortize the per-syscall cost.
+	CacheTimeout time.Duration
+	// DirectMount makes go-fuse perform the mount via the mount(2)
+	// syscall directly instead of invoking the setuid fusermount
+	// helper. This is required inside a user namespace (as used by
+	// `veilfs run`), where fusermount's setuid bit is neutralized but
+	// the namespace's mapped-root process holds CAP_SYS_ADMIN. It
+	// implies strict mode: there is no fallback to fusermount, so a
+	// mount failure surfaces the real mount(2) error rather than a
+	// misleading helper error.
+	DirectMount bool
 }
 
 // Mount starts a FUSE mount that mirrors sourcePath at mountPoint while
@@ -858,23 +880,27 @@ func Mount(sourcePath, mountPoint string, matcher Matcher, opts MountOptions) (*
 	if fsName == "" {
 		fsName = "veilfs"
 	}
-	// Both timeouts are pinned at zero so the kernel never serves an
-	// answer from its dentry or attribute cache without re-entering
-	// veilfs. The per-op guards already re-check the matcher, but
-	// caching positive dentries leaves a window after .veilignore
-	// reload where stat/open against a now-hidden path could be
-	// satisfied from cache. Zeroing both eliminates that window
-	// entirely. The cost is a syscall per path component on each
-	// access, which is acceptable for the secrecy-first design.
-	zero := time.Duration(0)
+	// Both timeouts share opts.CacheTimeout. The secure default (0)
+	// disables both kernel caches so every operation re-enters veilfs
+	// and re-checks the matcher; per-op guards on the FUSE handlers
+	// still protect callers that opt into a non-zero cache, but the
+	// configured window does leave a race where reload-after-stat can
+	// serve a previously-cached "exists" answer. Documented in
+	// MountOptions.CacheTimeout.
+	cacheDur := opts.CacheTimeout
+	if cacheDur < 0 {
+		cacheDur = 0
+	}
 	mountOpts := &fs.Options{
 		MountOptions: fuse.MountOptions{
-			Debug:  opts.Debug,
-			Name:   "fuse",
-			FsName: fsName,
+			Debug:             opts.Debug,
+			Name:              "fuse",
+			FsName:            fsName,
+			DirectMount:       opts.DirectMount,
+			DirectMountStrict: opts.DirectMount,
 		},
-		EntryTimeout: &zero,
-		AttrTimeout:  &zero,
+		EntryTimeout: &cacheDur,
+		AttrTimeout:  &cacheDur,
 	}
 	srv, err := fs.Mount(mountPoint, root, mountOpts)
 	if err != nil {

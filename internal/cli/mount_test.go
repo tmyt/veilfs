@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCheckNotNested(t *testing.T) {
@@ -79,4 +80,45 @@ func TestDetectCaseInsensitiveOnTempDir(t *testing.T) {
 		t.Errorf("probe left files behind: %v", names)
 	}
 	_ = filepath.Join // keep filepath import in case other helpers grow
+}
+
+func TestParseCacheTimeout(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		// Bare-number form (interpreted as seconds).
+		{"zero bare", "0", 0, false},
+		{"integer seconds", "2", 2 * time.Second, false},
+		{"fractional seconds", "0.5", 500 * time.Millisecond, false},
+		{"sub-second decimal", "0.2", 200 * time.Millisecond, false},
+		{"large bare", "60", 60 * time.Second, false},
+		// Go duration form.
+		{"go duration ms", "500ms", 500 * time.Millisecond, false},
+		{"go duration s", "1s", time.Second, false},
+		{"go duration m", "2m", 2 * time.Minute, false},
+		{"go duration compound", "1m30s", 90 * time.Second, false},
+		{"go duration zero", "0s", 0, false},
+		// Rejections.
+		{"empty rejected", "", 0, true},
+		{"alpha rejected", "abc", 0, true},
+		{"negative bare rejected", "-1", 0, true},
+		{"negative go duration rejected", "-1s", 0, true},
+		{"nan rejected", "NaN", 0, true},
+		{"absurd bare rejected", "1e9", 0, true},
+		{"unit-less letter rejected", "1q", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseCacheTimeout(tc.in)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("err = %v, wantErr=%v", err, tc.wantErr)
+			}
+			if !tc.wantErr && got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

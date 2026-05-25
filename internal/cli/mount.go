@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"veilfs/internal/ignore"
 	"veilfs/internal/vfs"
@@ -35,10 +36,12 @@ func Mount(args []string) error {
 	var foreground bool
 	var debug bool
 	var caseMode string
+	var cacheTimeout cacheTimeoutFlag
 	fs.StringVar(&configPath, "config", "", "path to an alternative ignore file (overrides .veilignore in source)")
 	fs.BoolVar(&foreground, "f", false, "run in the foreground instead of daemonizing")
 	fs.BoolVar(&debug, "debug", false, "enable FUSE protocol logging")
 	fs.StringVar(&caseMode, "case-mode", "auto", "case matching: auto|on|off (auto probes the source filesystem)")
+	fs.Var(&cacheTimeout, "cache-timeout", "FUSE entry+attr cache duration (0 = disable). Bare number = seconds (e.g. 2, 0.5); Go duration suffix accepted (e.g. 500ms, 1s, 2m). Raising trades secrecy after .veilignore reload for throughput.")
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: veilfs mount [flags] <source> <target>")
 		fs.PrintDefaults()
@@ -94,10 +97,72 @@ func Mount(args []string) error {
 	isDaemonChild := os.Getenv(daemonEnv) == "1"
 
 	if !foreground && !isDaemonChild {
-		return daemonize(source, target, ignorePath, configPath != "", debug, caseMode)
+		return daemonize(source, target, ignorePath, configPath != "", debug, caseMode, cacheTimeout.raw)
 	}
 
-	return serve(source, target, ignorePath, debug, isDaemonChild, caseInsensitive)
+	return serve(source, target, ignorePath, debug, isDaemonChild, caseInsensitive, cacheTimeout.d)
+}
+
+// cacheTimeoutFlag is a flag.Value implementation accepting either a
+// bare number (interpreted as seconds, so `--cache-timeout 2` = 2s) or
+// a Go duration string (`500ms`, `1s`, `2m`). The bare-number form is
+// the Unix tradition (sleep, timeout); the suffixed form is preserved
+// for callers who want sub-second precision and prefer
+// time.ParseDuration syntax.
+type cacheTimeoutFlag struct {
+	raw string        // original user input; forwarded verbatim to daemon child
+	d   time.Duration // parsed value (>= 0); zero when unset
+}
+
+func (c *cacheTimeoutFlag) String() string {
+	if c == nil || c.raw == "" {
+		return "0"
+	}
+	return c.raw
+}
+
+func (c *cacheTimeoutFlag) Set(s string) error {
+	d, err := parseCacheTimeout(s)
+	if err != nil {
+		return err
+	}
+	c.raw = s
+	c.d = d
+	return nil
+}
+
+// parseCacheTimeout converts a user-supplied --cache-timeout value into
+// a non-negative time.Duration. It first tries time.ParseDuration so
+// suffixed forms like "500ms" / "2s" win unambiguously; otherwise it
+// falls back to strconv.ParseFloat with the result treated as seconds.
+// NaN, infinities, negatives, and absurdly-large values are rejected
+// so the FUSE layer never sees a malformed duration.
+func parseCacheTimeout(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, errors.New("--cache-timeout cannot be empty")
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		if d < 0 {
+			return 0, fmt.Errorf("--cache-timeout must be >= 0 (got %s)", s)
+		}
+		return d, nil
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("--cache-timeout: %q is neither a number nor a Go duration (try 2, 0.5, 500ms, or 1s)", s)
+	}
+	if f != f { // NaN
+		return 0, fmt.Errorf("--cache-timeout must be a finite number")
+	}
+	if f < 0 {
+		return 0, fmt.Errorf("--cache-timeout must be >= 0 (got %v)", f)
+	}
+	// Sanity cap: very large values can overflow time.Duration (int64 ns).
+	// 1e6 seconds (~11 days) is well past any sane FUSE cache window.
+	if f > 1e6 {
+		return 0, fmt.Errorf("--cache-timeout too large (got %v seconds; max 1e6)", f)
+	}
+	return time.Duration(f * float64(time.Second)), nil
 }
 
 // resolveCaseMode maps the user-facing case-mode flag to a boolean.
@@ -126,7 +191,7 @@ func resolveCaseMode(mode, source string) (bool, error) {
 // serve performs the actual FUSE mount and blocks until the server stops
 // or a termination signal is received. When invoked as a daemon child,
 // it signals readiness on the inherited pipe before blocking.
-func serve(source, target, ignorePath string, debug, isDaemonChild, caseInsensitive bool) error {
+func serve(source, target, ignorePath string, debug, isDaemonChild, caseInsensitive bool, cacheTimeout time.Duration) error {
 	matcher, err := ignore.NewLiveMatcherWithOptions(ignorePath, source, ignore.Options{
 		CaseInsensitive: caseInsensitive,
 		Logf:            log.Printf,
@@ -141,7 +206,10 @@ func serve(source, target, ignorePath string, debug, isDaemonChild, caseInsensit
 	}
 	defer matcher.Stop()
 
-	srv, err := vfs.Mount(source, target, matcher, vfs.MountOptions{Debug: debug})
+	srv, err := vfs.Mount(source, target, matcher, vfs.MountOptions{
+		Debug:        debug,
+		CacheTimeout: cacheTimeout,
+	})
 	if err != nil {
 		notifyParent(isDaemonChild, false)
 		return fmt.Errorf("fuse mount: %w", err)
@@ -194,7 +262,7 @@ func notifyParent(isChild, ok bool) {
 
 // daemonize re-executes the current binary in the background and waits
 // for it to report mount success or failure via a pipe before returning.
-func daemonize(source, target, ignorePath string, configExplicit, debug bool, caseMode string) error {
+func daemonize(source, target, ignorePath string, configExplicit, debug bool, caseMode string, cacheTimeoutRaw string) error {
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("pipe: %w", err)
@@ -220,6 +288,13 @@ func daemonize(source, target, ignorePath string, configExplicit, debug bool, ca
 	}
 	if caseMode != "" && caseMode != "auto" {
 		childArgs = append(childArgs, "--case-mode", caseMode)
+	}
+	if cacheTimeoutRaw != "" {
+		// Forward the user's original string so `2`, `0.5`, `500ms`,
+		// and `1s` all reach the child unchanged. The child re-parses
+		// through the same cacheTimeoutFlag and rejects in the same
+		// way if (somehow) the input has become invalid.
+		childArgs = append(childArgs, "--cache-timeout", cacheTimeoutRaw)
 	}
 	childArgs = append(childArgs, source, target)
 

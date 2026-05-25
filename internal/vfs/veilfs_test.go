@@ -50,6 +50,12 @@ func fuseAvailable() bool {
 // patterns and returns the mount point plus a cleanup function. It calls
 // t.Skip when FUSE is not available on the host.
 func mountFixture(t *testing.T, source string, patterns string) (string, *ignore.LiveMatcher) {
+	return mountFixtureWithOpts(t, source, patterns, MountOptions{})
+}
+
+// mountFixtureWithOpts is the same as mountFixture but lets callers tune
+// the MountOptions (used to exercise non-default CacheTimeout etc.).
+func mountFixtureWithOpts(t *testing.T, source string, patterns string, opts MountOptions) (string, *ignore.LiveMatcher) {
 	t.Helper()
 	if !fuseAvailable() {
 		t.Skip("FUSE backend not installed on this host; skipping E2E test")
@@ -69,7 +75,7 @@ func mountFixture(t *testing.T, source string, patterns string) (string, *ignore
 	}
 
 	mountPoint := t.TempDir()
-	srv, err := Mount(source, mountPoint, matcher, MountOptions{})
+	srv, err := Mount(source, mountPoint, matcher, opts)
 	if err != nil {
 		matcher.Stop()
 		t.Fatalf("Mount: %v", err)
@@ -286,6 +292,40 @@ func TestE2E_HotReloadBypassesDentryCache(t *testing.T) {
 	}
 	if err := os.Remove(target); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("unlink while dentry cached: want ENOENT, got %v", err)
+	}
+}
+
+func TestE2E_CacheTimeoutKeepsStatHotAfterReload(t *testing.T) {
+	// The opt-in `CacheTimeout` exposes the FUSE EntryTimeout +
+	// AttrTimeout knob. When set, a stat result that was warmed
+	// before a .veilignore reload must keep returning success for the
+	// configured window (the kernel does not call us back). After the
+	// window expires the matcher takes effect again.
+	src := t.TempDir()
+	mkfile(t, filepath.Join(src, "cached.txt"), "kernel-cached")
+
+	mnt, _ := mountFixtureWithOpts(t, src, "# nothing\n", MountOptions{
+		CacheTimeout: 2 * time.Second,
+	})
+
+	target := filepath.Join(mnt, "cached.txt")
+
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("warm-up stat: %v", err)
+	}
+
+	// Hide the file via hot reload.
+	cfg := filepath.Join(src, ignore.IgnoreFileName)
+	if err := os.WriteFile(cfg, []byte("cached.txt\n"), 0o644); err != nil {
+		t.Fatalf("rewrite .veilignore: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	// Within the cache window the kernel must still answer stat from
+	// its own cache rather than calling into veilfs. This is the
+	// secrecy-vs-throughput trade-off the flag is for.
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("stat within cache window: want cached success, got %v", err)
 	}
 }
 
