@@ -96,6 +96,16 @@ func Mount(args []string) error {
 
 	isDaemonChild := os.Getenv(daemonEnv) == "1"
 
+	// Surface missing FUSE prerequisites in the parent, before daemonizing,
+	// so the cause is visible without re-running in the foreground. The
+	// daemon child skips this: its environment matches the parent that
+	// already passed.
+	if !isDaemonChild {
+		if err := checkFUSEPrereqs(); err != nil {
+			return err
+		}
+	}
+
 	if !foreground && !isDaemonChild {
 		return daemonize(source, target, ignorePath, configPath != "", debug, caseMode, cacheTimeout.raw)
 	}
